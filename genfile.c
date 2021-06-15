@@ -1,9 +1,12 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -14,6 +17,7 @@ char *string =
     "\n\n\n";
 
 #define BUFFER_SIZE 1024
+#define progress_bar_len_max 512
 
 const struct option long_options[] = {
     {"files", required_argument, 0, 'f'}, {"size", required_argument, 0, 's'},
@@ -35,6 +39,18 @@ void print_version();
 void memDump(char *desc, void *addr, int len, char *prefix);
 
 unsigned long strtosize(const char *restrict str);
+int progress(int total, float prog, FILE *file, const char *_fmt, ...);
+
+static int fd = -1;
+char *buffer = NULL;
+
+void handle_int(int sig_num)
+{
+    if (buffer != NULL) free(buffer);
+    if (fd != -1) close(fd);
+    fflush(stdout);
+    exit(sig_num);
+}
 
 int main(int argc, char *argv[])
 {
@@ -74,22 +90,27 @@ int main(int argc, char *argv[])
         }
     }
 
-    printf("file size: %ld\n", file_size);
+    buffer = (char *)malloc(sizeof(char) * block_size);
+    if (buffer == NULL) goto ext;
 
     if (file_size > ((long)1 << 36)) {
         printf("Size tooo large: %ldG, limit 64G\n", file_size >> 30);
-        return -1;
+        goto ext;
     }
 
-    int fd = open(file_name, O_WRONLY | O_CREAT, 0666);
+    fd = open(file_name, O_WRONLY | O_CREAT, 0666);
+    if (fd == -1) {
+        perror("failed to open file descriptor.");
+        free(buffer);
+        exit(-1);
+    }
 
     if (file_size == 0) {
         printf("0 byte wrote.\n");
-        close(fd);
-        return 0;
+        goto ext;
     }
 
-    char *buffer = (char *)malloc(sizeof(char) * block_size);
+    if (ftruncate(fd, 0) == -1) goto ext;
 
     const int mySeed = clock();
     srand(mySeed);
@@ -98,9 +119,12 @@ int main(int argc, char *argv[])
     unsigned long write_size = 0;
 
     long sign = 0, diff = 0;
+    unsigned long rest_size = file_size;
+    int colnum = 0;
+    struct winsize w;
 
-    while (file_size != 0) {
-        diff = file_size - block_size;
+    while (rest_size != 0) {
+        diff = rest_size - block_size;
         sign = diff >> (sizeof(long) * 8 - 1);
 
         write_size = block_size + (diff & sign);
@@ -111,10 +135,17 @@ int main(int argc, char *argv[])
 
         write(fd, buffer, write_size);
 
-        file_size -= write_size;
+        rest_size -= write_size;
+
+        ioctl(0, TIOCGWINSZ, &w);
+        printf("\r");
+        progress(w.ws_col, 100.0 - (rest_size * 100.0 / file_size), stdout,
+                 "%-15s", "generateing");
     }
 
-    close(fd);
+ext:
+    if (buffer != NULL) free(buffer);
+    if (fd != -1) close(fd);
 
     return 0;
 }
@@ -206,4 +237,42 @@ void memDump(char *desc, void *addr, int len, char *prefix)
         i++;
     }
     printf(" | %s\n", buff);
+}
+
+int progress(int total, float prog, FILE *file, const char *_fmt, ...)
+{
+    if (prog > 100.0) {
+        prog = 100.0;
+    }
+    va_list ap;
+    va_start(ap, _fmt);
+
+    char progress_buffer[progress_bar_len_max] = {0};
+
+    vsnprintf(progress_buffer, progress_bar_len_max, _fmt, ap);
+
+    total = total > progress_bar_len_max ? progress_bar_len_max : total;
+
+    int len = strnlen(progress_buffer, progress_bar_len_max);
+    int tail = 6;
+    int fin = (total - len - 4 - tail) * (prog / 100.0);
+    int rest = (total - len - 4 - tail) - fin;
+
+    progress_buffer[len] = ' ';
+    progress_buffer[len + 1] = '[';
+
+    for (int i = 0; i < fin; i++) {
+        progress_buffer[len + 2 + i] = '#';
+    }
+    for (int i = 0; i < rest; i++) {
+        progress_buffer[len + 2 + i + fin] = '.';
+    }
+
+    snprintf(progress_buffer, progress_bar_len_max, "%s] %4.1f%c",
+             progress_buffer, prog, '%');
+
+    fwrite(progress_buffer, total, 1, file);
+    fflush(file);
+    va_end(ap);
+    return 0;
 }
